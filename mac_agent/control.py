@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from typing import Optional
 
 from shared.protocol import Action
@@ -13,6 +14,14 @@ class AdbControl:
 
     def execute(self, action: Action) -> None:
         if action.type == "tap":
+            # One finger — best-effort joystick nudge then tap (~not true multitouch).
+            if action.pre_joystick_pad:
+                self._run([
+                    "shell", "input", "swipe",
+                    str(action.jx), str(action.jy),
+                    str(action.jx2), str(action.jy2), "90",
+                ])
+                time.sleep(0.03)
             self._run(["shell", "input", "tap", str(action.x), str(action.y)])
         elif action.type == "swipe":
             self._run([

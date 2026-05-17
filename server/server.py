@@ -127,6 +127,8 @@ async def main(host: str, port: int, templates_dir: Path,
                vision_combo_post_gap: int,
                vision_combo_allow_max_tier: int,
                vision_combo_force_tail_on_timeout: bool,
+               vision_combo_min_bar_rel: float,
+               vision_combo_enemy_stable_frames: int,
                vision_attack: bool, vision_color: str,
                vision_debug_dir: str | None,
                vision_roi: str | None,
@@ -136,7 +138,13 @@ async def main(host: str, port: int, templates_dir: Path,
                vision_combat_max_tier: int,
                vision_tap_max_tier: int,
                vision_det_exclude_top: float,
-               vision_det_exclude_bottom: float) -> None:
+               vision_det_exclude_bottom: float,
+               vision_move_only: bool) -> None:
+    if vision_move_only and not vision_combo and not vision_attack:
+        print("[server] WARN: --vision-move-only only applies with "
+              "--vision-combo or --vision-attack; ignoring")
+        vision_move_only = False
+
     decider: Decider
     buttons = dict(DEFAULT_BUTTONS)
     buttons.update(parse_button_overrides(button_overrides))
@@ -168,6 +176,9 @@ async def main(host: str, port: int, templates_dir: Path,
             combo_allow_max_tier=vision_combo_allow_max_tier,
             fallback_direction=vision_fallback_dir,
             gate_timeout_force_tail=vision_combo_force_tail_on_timeout,
+            combo_min_bar_area_rel=vision_combo_min_bar_rel,
+            enemy_stable_frames=vision_combo_enemy_stable_frames,
+            attacks_enabled=not vision_move_only,
             **vision_kwargs,
         )
         if vision_attack_range is not None:
@@ -185,6 +196,7 @@ async def main(host: str, port: int, templates_dir: Path,
         kwargs["tap_max_combat_tier"] = vision_tap_max_tier
         kwargs["det_exclude_top_frac"] = vision_det_exclude_top
         kwargs["det_exclude_bottom_frac"] = vision_det_exclude_bottom
+        kwargs["attacks_enabled"] = not vision_move_only
         decider = VisionAttackDecider(
             hsv_color=vision_color,
             attack_xy=buttons["A"],
@@ -263,6 +275,17 @@ if __name__ == "__main__":
                     help="If wait_gate times out without detecting icon dim, still "
                          "tap the remainder of the combo (legacy; often empty). "
                          "Default: bail to idle/chase instead.")
+    ap.add_argument("--vision-combo-min-bar-rel", type=float, default=0.001,
+                    metavar="FRAC",
+                    help="Minimum picked HP-bar bounding-box area (w×h) as "
+                         "a fraction of frame width×height before TAP ping "
+                         "gate skill — filters tiny HUD false positives "
+                         "(default 0.001).")
+    ap.add_argument("--vision-combo-enemy-stable", type=int, default=5,
+                    metavar="N",
+                    dest="vision_combo_enemy_stable_frames",
+                    help="Frames the melee+latch must stay valid before firing "
+                         "gate skill (default 5).")
     ap.add_argument("--vision-combo-post-gap", type=int, default=4,
                     help="No-op frames between middle and last skill taps "
                          "(default 4).")
@@ -275,6 +298,11 @@ if __name__ == "__main__":
                          "raise this.")
     ap.add_argument("--vision-attack", action="store_true",
                     help="Only tap basic-attack when an HP bar is visible.")
+    ap.add_argument("--vision-move-only", action="store_true",
+                    help="With --vision-combo or --vision-attack: disable all "
+                         "taps (no skills, no basic attack). Only chase via "
+                         "joystick + optional --vision-fallback-dir when no "
+                         "target.")
     ap.add_argument("--vision-color", default="red,purple",
                     help="HP bar color(s) to detect, comma-separated. "
                          "Options: red,green,yellow,orange,purple,cyan. "
@@ -329,9 +357,12 @@ if __name__ == "__main__":
                      args.vision_combo_post_gap,
                      args.vision_combo_allow_max_tier,
                      args.vision_combo_force_tail_on_timeout,
+                     args.vision_combo_min_bar_rel,
+                     args.vision_combo_enemy_stable_frames,
                      args.vision_attack, args.vision_color,
                      args.vision_debug_dir, args.vision_roi,
                      args.vision_fallback_dir,
                      args.vision_attack_range, args.vision_attack_foot_bias,
                      args.vision_combat_max_tier, args.vision_tap_max_tier,
-                     args.vision_det_exclude_top, args.vision_det_exclude_bottom))
+                     args.vision_det_exclude_top, args.vision_det_exclude_bottom,
+                     args.vision_move_only))

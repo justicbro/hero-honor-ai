@@ -242,9 +242,18 @@ class SendeventControl:
 
     def execute(self, action: Action) -> None:
         if action.type == "tap":
-            if self._release_joy_before_skill_tap:
+            if self._release_joy_before_skill_tap and not action.pre_joystick_pad:
                 self._joystick_release()
                 time.sleep(0.04)
+            elif action.pre_joystick_pad:
+                hold_ms_pad = max(action.duration_ms, 600)
+                self._joystick_from_to(
+                    action.jx,
+                    action.jy,
+                    action.jx2,
+                    action.jy2,
+                    hold_ms=hold_ms_pad,
+                )
             t = threading.Thread(
                 target=self._tap,
                 args=(action.x, action.y, action.duration_ms),

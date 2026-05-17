@@ -31,6 +31,30 @@ from mac_agent.control import AdbControl
 from shared.protocol import Action, Hello
 
 
+def _explain_handshake_failure(server_url: str, exc: BaseException) -> None:
+    print(
+        f"\n[agent] FATAL: WebSocket handshake to {server_url!r} timed out "
+        f"({exc}).\n"
+        "  Common causes:\n"
+        "  • Wrong IP/host — confirm the Linux server LAN IP "
+        "(on server: ip -br -4 a 或 hostname -I).\n"
+        "  • 服务未监听 0.0.0.0:8765，或防火墙/云安全组拦住 TCP 8765。\n"
+        "  • Mac 与服务器不在同一可路由网段 / 未连 VPN。\n"
+        "  在 Mac 上试: nc -vz 服务器IP 8765 （应显示 succeeded/open）。\n"
+        "  可加长握手等待: --open-timeout 120\n",
+        file=sys.stderr,
+    )
+
+
+def _explain_connection_refused(server_url: str, exc: BaseException) -> None:
+    print(
+        f"\n[agent] FATAL: refused TCP connection to {server_url!r} ({exc}).\n"
+        "  • Server 没在跑，或 --port 与 agent 不一致。\n"
+        "  • IP 写成别的机器。\n",
+        file=sys.stderr,
+    )
+
+
 def make_capture(backend: str, max_size: int, jpeg_quality: int):
     """Return a capture object with grab_jpeg / screen_size / check_device."""
     if backend == "screenrecord":
@@ -61,7 +85,8 @@ async def run(server_url: str, fps: float, jpeg_quality: int,
               control_backend: str,
               pause_actions: bool,
               release_joy_before_skill_tap: bool,
-              recv_timeout: float | None) -> None:
+              recv_timeout: float | None,
+              open_timeout: float) -> None:
     cap = make_capture(capture_backend, capture_max_size, jpeg_quality)
     serial = cap.check_device()
     w, h = cap.screen_size()
@@ -73,7 +98,8 @@ async def run(server_url: str, fps: float, jpeg_quality: int,
     recv_skips = 0
     print(f"[agent] capture={capture_backend} control={control_backend} "
           f"device={serial} screen={w}x{h} -> {server_url} @ {fps}fps "
-          f"recv_timeout≤{recv_budget:.2f}s"
+          f"recv_timeout≤{recv_budget:.2f}s "
+          f"open_timeout≤{open_timeout:g}s"
           + (" [DRY-RUN: actions not executed]" if dry_run else ""))
 
     # One RTT must cover JPEG uplink + infer + JSON downlink. Using exactly
@@ -89,50 +115,64 @@ async def run(server_url: str, fps: float, jpeg_quality: int,
         await loop.run_in_executor(None, sys.stdin.readline)
 
     try:
-        async with websockets.connect(server_url, max_size=4 * 1024 * 1024) as ws:
-            await ws.send(Hello(width=w, height=h, fps=fps).to_json())
-            if pause_actions:
-                await wait_enter()
-                print("[agent] resume: executing server actions.")
+        try:
+            async with websockets.connect(
+                    server_url,
+                    max_size=4 * 1024 * 1024,
+                    open_timeout=open_timeout,
+            ) as ws:
+                await ws.send(Hello(width=w, height=h, fps=fps).to_json())
+                if pause_actions:
+                    await wait_enter()
+                    print("[agent] resume: executing server actions.")
 
-            frame_id = 0
-            while True:
-                t0 = time.time()
-                try:
-                    frame = cap.grab_jpeg(quality=jpeg_quality)
-                except Exception as e:
-                    print(f"[agent] capture error: {e}")
-                    await asyncio.sleep(0.5)
-                    continue
+                frame_id = 0
+                while True:
+                    t0 = time.time()
+                    try:
+                        frame = cap.grab_jpeg(quality=jpeg_quality)
+                    except Exception as e:
+                        print(f"[agent] capture error: {e}")
+                        await asyncio.sleep(0.5)
+                        continue
 
-                if save_frame and frame_id == 0:
-                    Path(save_frame).write_bytes(frame)
-                    print(f"[agent] saved first frame -> {save_frame} "
-                          f"({len(frame)} bytes)")
+                    if save_frame and frame_id == 0:
+                        Path(save_frame).write_bytes(frame)
+                        print(f"[agent] saved first frame -> {save_frame} "
+                              f"({len(frame)} bytes)")
 
-                await ws.send(frame)
+                    await ws.send(frame)
 
-                try:
-                    reply = await asyncio.wait_for(
-                        ws.recv(), timeout=recv_budget)
-                    action = Action.from_json(reply)
-                    if action.type != "noop":
-                        if not dry_run:
-                            ctl.execute(action)
-                        print(f"[agent] frame#{frame_id} -> {action}"
-                              + (" [skipped]" if dry_run else ""))
-                except asyncio.TimeoutError:
-                    recv_skips += 1
-                    if recv_skips == 1 or recv_skips % 45 == 0:
-                        print(f"[agent] WARN: recv timed out "
-                              f"({recv_budget:.2f}s) x{recv_skips} — "
-                              f"moves/skills skipped; raise "
-                              f"--recv-timeout or lower --fps")
+                    try:
+                        reply = await asyncio.wait_for(
+                            ws.recv(), timeout=recv_budget)
+                        action = Action.from_json(reply)
+                        if action.type != "noop":
+                            if not dry_run:
+                                ctl.execute(action)
+                            print(f"[agent] frame#{frame_id} -> {action}"
+                                  + (" [skipped]" if dry_run else ""))
+                    except asyncio.TimeoutError:
+                        recv_skips += 1
+                        if recv_skips == 1 or recv_skips % 45 == 0:
+                            print(f"[agent] WARN: recv timed out "
+                                  f"({recv_budget:.2f}s) x{recv_skips} — "
+                                  f"moves/skills skipped; raise "
+                                  f"--recv-timeout or lower --fps")
 
-                frame_id += 1
-                dt = time.time() - t0
-                if dt < interval:
-                    await asyncio.sleep(interval - dt)
+                    frame_id += 1
+                    dt = time.time() - t0
+                    if dt < interval:
+                        await asyncio.sleep(interval - dt)
+        except TimeoutError as exc:
+            msg = str(exc).lower()
+            if "opening handshake" in msg or "timed out during opening" in msg:
+                _explain_handshake_failure(server_url, exc)
+                raise SystemExit(2) from exc
+            raise
+        except ConnectionRefusedError as exc:
+            _explain_connection_refused(server_url, exc)
+            raise SystemExit(2) from exc
     finally:
         ctl.close()
         print("[agent] control released (joystick fingertip UP if "
@@ -178,6 +218,12 @@ def main() -> None:
         help="Max seconds to wait for inference reply after each frame (default "
              "max(0.65, 3/fps)). Increase when remote server/Wi‑Fi is slow — "
              "otherwise swipes/taps are silently dropped.")
+    ap.add_argument(
+        "--open-timeout", type=float, default=45.0, metavar="SEC",
+        help="Max seconds for TCP connect + WebSocket opening handshake "
+             "(default 45). Increase only after confirming host:port reachable "
+             "with e.g. nc -vz HOST 8765.",
+    )
     args = ap.parse_args()
     try:
         asyncio.run(run(args.server, args.fps, args.jpeg_quality,
@@ -185,7 +231,7 @@ def main() -> None:
                         args.capture, args.capture_max_size,
                         args.control, args.pause_actions,
                         args.release_joystick_before_skill_tap,
-                        args.recv_timeout))
+                        args.recv_timeout, args.open_timeout))
     except KeyboardInterrupt:
         print("\n[agent] stopped by user")
 

@@ -464,7 +464,8 @@ class VisionAttackDecider:
                  # Drop centroid y inside top HUD / bottom skill band (false HP
                  # bars on scoreboard vs skill trims). Pass 0.0 to disable.
                  det_exclude_top_frac: float = 0.09,
-                 det_exclude_bottom_frac: float = 0.42):
+                 det_exclude_bottom_frac: float = 0.42,
+                 attacks_enabled: bool = True):
         from server.vision import HSV_PRESETS, annotate, find_hp_bars
 
         color_names = [c.strip().lower() for c in hsv_color.split(",")
@@ -537,6 +538,7 @@ class VisionAttackDecider:
                 "tap_max_combat_tier must satisfy 0 <= tap_max_combat_tier "
                 "<= max_combat_tier")
         self._tap_max_tier = tap_max_combat_tier
+        self._attacks_enabled = attacks_enabled
         for name, fv in (
                 ("det_exclude_top_frac", det_exclude_top_frac),
                 ("det_exclude_bottom_frac", det_exclude_bottom_frac),
@@ -554,6 +556,7 @@ class VisionAttackDecider:
               f"chase={chase} attack_xy={attack_xy} "
               f"attack_range_rel={attack_range_rel} foot_bias_rel="
               f"{attack_foot_bias_rel} "
+              f"attacks={'on' if self._attacks_enabled else 'OFF (move-only)'} "
               f"self_exclude=({self_exclude_x_rel}x{self_exclude_y_rel}), "
               f"cy_shift={self_exclude_center_y_shift_rel:+g} fallback_dir="
               f"{self._fallback_label} det_y_exclude_top="
@@ -619,8 +622,8 @@ class VisionAttackDecider:
                 extras.append(f"self_roi_green={dropped_self}")
             if dropped_vert:
                 extras.append(f"top_bot_band={dropped_vert}")
-            if extras:
-                msg += f" ({', '.join(extras)})"
+            if extras2:
+                msg += f" ({', '.join(extras2)})"
             print(msg)
 
         if not dets:
@@ -642,6 +645,31 @@ class VisionAttackDecider:
                 print(f"[vision] frame#{self._frame_id}: no target -> "
                       f"WANDER {self._fallback_label} "
                       f"swipe({jcx},{jcy})->({ex},{ey}) hold={self._swipe_ms}ms")
+            return Action(type="swipe", x=jcx, y=jcy, x2=ex, y2=ey,
+                          duration_ms=self._swipe_ms)
+
+        if not self._attacks_enabled:
+            if now_ms < self._next_swipe_allowed_ms:
+                return Action(type="noop")
+            best = pick_best_hp_det(dets, cx_self, cy_geom)
+            foot_y = min(
+                int(best.y + self._foot_bias_rel * h_img),
+                h_img - 2,
+            )
+            dx = best.x - cx_self
+            dy = foot_y - cy_geom
+            dist = math.hypot(dx, dy)
+            if dist < 2.0:
+                return Action(type="noop")
+            ux = dx / max(dist, 1e-6)
+            uy = dy / max(dist, 1e-6)
+            jx, jy = self._joystick_xy
+            jcx = int(jx * self._w)
+            jcy = int(jy * self._h)
+            deflection = int(self._joystick_dist_rel * self._w)
+            ex = int(jcx + ux * deflection)
+            ey = int(jcy + uy * deflection)
+            self._next_swipe_allowed_ms = now_ms + self._swipe_reissue_after_ms
             return Action(type="swipe", x=jcx, y=jcy, x2=ex, y2=ey,
                           duration_ms=self._swipe_ms)
 
@@ -754,7 +782,7 @@ class VisionEnemyComboDecider:
             gate_timeout_frames: int = 22,
             post_skill_gap_frames: int = 4,
             refractory_frames: int = 40,
-            enemy_stable_frames: int = 2,
+            enemy_stable_frames: int = 5,
             duration_ms: int = 60,
             det_exclude_top_frac: float = 0.09,
             det_exclude_bottom_frac: float = 0.42,
@@ -775,6 +803,13 @@ class VisionEnemyComboDecider:
             # older builds always TAP the rest of the combo — that produces many
             # empty casts when the gate skill never left cooldown visually.
             gate_timeout_force_tail: bool = False,
+            # When False: never tap skills / combo — only chase + fallback wander
+            # (for verifying joystick control).
+            attacks_enabled: bool = True,
+            # Ignore tiny rectangles (often HUD trims) when deciding to TAP the
+            # gate skill — requires bbox area ≥ max(abs_floor, rel * frame_px).
+            combo_min_bar_area_rel: float = 0.001,
+            combo_bar_min_abs_px: int = 520,
     ):
         from pathlib import Path
 
@@ -823,6 +858,12 @@ class VisionEnemyComboDecider:
         self._post_gap = max(0, post_skill_gap_frames)
         self._refrac = max(0, refractory_frames)
         self._enemy_stable = max(1, enemy_stable_frames)
+        if not (0.0 <= combo_min_bar_area_rel <= 0.06):
+            raise ValueError(
+                "combo_min_bar_area_rel must be in [0.0, 0.06] "
+                "(fraction of full frame pixels)")
+        self._combo_min_bar_area_rel = combo_min_bar_area_rel
+        self._combo_bar_min_abs_px = max(32, int(combo_bar_min_abs_px))
         self._duration_ms = duration_ms
         for name, fv in (
                 ("det_exclude_top_frac", det_exclude_top_frac),
@@ -878,6 +919,7 @@ class VisionEnemyComboDecider:
         self._gate_ref_v = 0.0
         self._next_idx = 0
         self._gate_timeout_force_tail = gate_timeout_force_tail
+        self._attacks_enabled = attacks_enabled
 
         print(f"[vision-combo] VisionEnemyComboDecider combo={''.join(seq)} "
               f"(gate skill {seq[0]!r}) chase={chase_before_combo} "
@@ -886,7 +928,21 @@ class VisionEnemyComboDecider:
               f" colors={self._color_label} max_combat_tier={max_combat_tier} "
               f"skip_gate={self._skip_after_gate} gate_timeout="
               f"{gate_timeout_frames} force_tail_on_timeout="
-              f"{gate_timeout_force_tail} fallback={self._fallback_label}")
+              f"{gate_timeout_force_tail} bar≥max({self._combo_bar_min_abs_px}px,"
+              f"{self._combo_min_bar_area_rel:g}×frame stable="
+              f"{self._enemy_stable}f)"
+              f" fallback={self._fallback_label}"
+              f" attacks={'on' if self._attacks_enabled else 'OFF (move-only)'}")
+
+    def _combo_target_bar_ok(self, best: object, w_img: int, h_img: int) -> bool:
+        bw = max(1, getattr(best, "w", 0))
+        bh = max(1, getattr(best, "h", 0))
+        area = bw * bh
+        thresh = max(
+            self._combo_bar_min_abs_px,
+            int(self._combo_min_bar_area_rel * w_img * h_img),
+        )
+        return area >= thresh
 
     def set_screen_size(self, w: int, h: int) -> None:
         self._w, self._h = w, h
@@ -897,6 +953,23 @@ class VisionEnemyComboDecider:
         x = int(rx * self._w) if 0.0 <= rx <= 1.0 else int(rx)
         y = int(ry * self._h) if 0.0 <= ry <= 1.0 else int(ry)
         return Action(type="tap", x=x, y=y, duration_ms=self._duration_ms)
+
+    def _tap_with_walk_if_swipe(self, skill: str, pad: Action) -> Action:
+        """Skill tap preceded by joystick swipe on the same server frame."""
+        tap = self._tap(skill)
+        if pad.type != "swipe":
+            return tap
+        return Action(
+            type="tap",
+            x=tap.x,
+            y=tap.y,
+            duration_ms=tap.duration_ms,
+            pre_joystick_pad=True,
+            jx=pad.x,
+            jy=pad.y,
+            jx2=pad.x2,
+            jy2=pad.y2,
+        )
 
     def _wander_swipe_if_any(self, now_ms: float) -> Action:
         if self._fallback_dir is None:
@@ -943,6 +1016,30 @@ class VisionEnemyComboDecider:
                 (best.label or "").lower(), 99)
             print(f"[vision-combo] frame#{self._frame_id}: CHASE toward "
                   f"({best.x},{best.y}) tier={tier_b}")
+        return Action(type="swipe", x=jcx, y=jcy, x2=ex, y2=ey,
+                      duration_ms=self._swipe_ms)
+
+    def _direct_chase_best_swipe(self, dets: list, h_img: int, w_img: int,
+                                 cx_self: int, cy_geom: int) -> Action:
+        """Joystick toward pick_best_hp_det (move-only; no min-steer filter)."""
+        if not dets:
+            return Action(type="noop")
+        best = pick_best_hp_det(dets, cx_self, cy_geom)
+        tb = LABEL_COMBAT_PRIORITY.get((best.label or "").lower(), 99)
+        if tb > self._max_combat_tier:
+            return Action(type="noop")
+        dx, dy, dist = enemy_foot_dx_dy_dist(
+            best, cx_self, cy_geom, h_img, self._foot_bias_rel)
+        if dist < 2.0:
+            return Action(type="noop")
+        ux = dx / max(dist, 1e-6)
+        uy = dy / max(dist, 1e-6)
+        jx, jy = self._joystick_xy
+        jcx = int(jx * self._w)
+        jcy = int(jy * self._h)
+        deflection = int(self._joystick_dist_rel * self._w)
+        ex = int(jcx + ux * deflection)
+        ey = int(jcy + uy * deflection)
         return Action(type="swipe", x=jcx, y=jcy, x2=ex, y2=ey,
                       duration_ms=self._swipe_ms)
 
@@ -1014,6 +1111,20 @@ class VisionEnemyComboDecider:
                 msg += f" ({', '.join(extras2)})"
             print(msg)
 
+        if not self._attacks_enabled:
+            self._phase = "idle"
+            self._enemy_streak = 0
+            self._wait_frames = 0
+            self._cd_streak = 0
+            self._gap_left = 0
+            self._refrac_left = 0
+            self._next_idx = 0
+            self._gate_ref_v = 0.0
+            if enemy_here:
+                return self._direct_chase_best_swipe(
+                    dets, h_img, w_img, cx_self, cy_geom)
+            return self._wander_swipe_if_any(now_ms)
+
         gate_skill = self._combo[0]
         grx, gry = self._buttons[gate_skill]
 
@@ -1050,7 +1161,8 @@ class VisionEnemyComboDecider:
             far = dist_rel >= self._attack_range_rel
             tier_block = tier_best > self._combo_allow_max_tier
             too_centered = dist_rel < self._min_steer_dist_rel
-            if far or tier_block or too_centered:
+            thin_phantom = not self._combo_target_bar_ok(best, w_img, h_img)
+            if far or tier_block or too_centered or thin_phantom:
                 self._enemy_streak = 0
                 return self._chase_best_swipe(
                     dets, h_img, w_img, cx_self, cy_geom, now_ms)
@@ -1071,7 +1183,9 @@ class VisionEnemyComboDecider:
             print(f"[vision-combo] frame#{self._frame_id}: melee+combo OK "
                   f"tier={tb} -> TAP {gate_skill} "
                   f"ref_V={self._gate_ref_v:.1f}")
-            return self._tap(gate_skill)
+            walk_pad = self._chase_best_swipe(
+                dets, h_img, w_img, cx_self, cy_geom, now_ms, silent=True)
+            return self._tap_with_walk_if_swipe(gate_skill, walk_pad)
 
         if self._phase == "wait_gate":
             self._wait_frames += 1
@@ -1092,6 +1206,15 @@ class VisionEnemyComboDecider:
             _, _, dist_w = enemy_foot_dx_dy_dist(
                 best, cx_self, cy_geom, h_img, self._foot_bias_rel)
             dist_rel_w = dist_w / float(max(w_img, h_img))
+            if not self._combo_target_bar_ok(best, w_img, h_img):
+                if self._frame_id % 90 == 0:
+                    print(f"[vision-combo] frame#{self._frame_id}: gate abort "
+                          f"(bar bbox too small — likely HUD phantom)")
+                self._phase = "idle"
+                self._enemy_streak = 0
+                self._wait_frames = 0
+                self._cd_streak = 0
+                return chase_move
             if tier_best > self._combo_allow_max_tier:
                 print(f"[vision-combo] frame#{self._frame_id}: tier={tier_best} "
                       f"> allow {self._combo_allow_max_tier} -> abort gate")
@@ -1130,7 +1253,7 @@ class VisionEnemyComboDecider:
                 self._gap_left = self._post_gap
                 sk = self._combo[self._next_idx]
                 print(f"[vision-combo] frame#{self._frame_id}: TAP {sk}")
-                return self._tap(sk)
+                return self._tap_with_walk_if_swipe(sk, chase_move)
             if timed_out:
                 if self._gate_timeout_force_tail:
                     print(f"[vision-combo] frame#{self._frame_id}: gate "
@@ -1142,7 +1265,7 @@ class VisionEnemyComboDecider:
                     self._gap_left = self._post_gap
                     sk = self._combo[self._next_idx]
                     print(f"[vision-combo] frame#{self._frame_id}: TAP {sk}")
-                    return self._tap(sk)
+                    return self._tap_with_walk_if_swipe(sk, chase_move)
                 print(f"[vision-combo] frame#{self._frame_id}: gate timeout "
                       f"(V={cur_v:.1f}) -> bail (enable "
                       f"--vision-combo-force-tail-on-timeout to restore old)")
@@ -1176,7 +1299,7 @@ class VisionEnemyComboDecider:
                 self._phase = "gap"
                 self._gap_left = self._post_gap
             print(f"[vision-combo] frame#{self._frame_id}: TAP {sk}")
-            return self._tap(sk)
+            return self._tap_with_walk_if_swipe(sk, gm)
 
         if self._phase == "fire_last":
             self._phase = "refractory"
