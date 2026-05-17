@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.log
+.DS_Store
+.idea/
+.vscode/
+# Root debug exports (regenerate with tools/vision_preview.py etc.)
+_latest.jpg
+_vision*.jpg
+_vision*.json
+logs/
+
+server/templates/*.png
+!server/templates/README.md
