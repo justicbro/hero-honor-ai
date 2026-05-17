@@ -1,4 +1,7 @@
+<<<<<<< HEAD
 # honor-ai
+
+GitHub 仓库名：[hero-honor-ai](https://github.com/justicbro/hero-honor-ai)。
 
 王者荣耀 AI 实验项目。当前阶段：**最小可行链路 demo**（Mac 模拟器采集 → 服务器推理 → 回传动作）。
 
@@ -167,4 +170,3 @@ PYTHONPATH=. python -m mac_agent.agent \
 
 - `--fps 5`：demo 阶段建议；ADB screencap 最多 ~5fps
 - `--jpeg-quality 70`：质量/带宽平衡点；高分屏可降到 50
-- `MATCH_THRESHOLD = 0.85`（`inference.py`）：模板匹配阈值，误触多就调高
